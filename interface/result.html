@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prediction Result — Heart Disease AI</title>
+<style>
+  :root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #30363d;
+    --text:    #c9d1d9;
+    --muted:   #8b949e;
+    --heading: #f0f6fc;
+    --accent:  #e05252;
+    --safe:    #2ea043;
+    --radius:  8px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 32px;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .header-icon {
+    width: 36px; height: 36px;
+    background: linear-gradient(135deg, var(--accent), #c0392b);
+    border-radius: 8px; display: grid; place-items: center; font-size: 18px;
+  }
+  header h1 { font-size: 16px; font-weight: 700; color: var(--heading); }
+  header p  { font-size: 11px; color: var(--muted); }
+  .back-btn {
+    margin-left: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text); font-size: 12px;
+    padding: 7px 16px; border-radius: 6px;
+    text-decoration: none; transition: border-color 0.15s;
+  }
+  .back-btn:hover { border-color: var(--muted); }
+
+  main { max-width: 960px; margin: 32px auto; padding: 0 20px 60px; }
+
+  /* ── Verdict Banner ── */
+  .verdict {
+    border-radius: var(--radius);
+    padding: 24px 28px;
+    margin-bottom: 28px;
+    border: 1px solid;
+    display: flex; align-items: center; gap: 20px;
+  }
+  .verdict.disease {
+    background: rgba(224,82,82,0.08);
+    border-color: rgba(224,82,82,0.35);
+  }
+  .verdict.safe {
+    background: rgba(46,160,67,0.08);
+    border-color: rgba(46,160,67,0.35);
+  }
+  .verdict-icon { font-size: 40px; flex-shrink: 0; }
+  .verdict h2 {
+    font-size: 22px; font-weight: 800; margin-bottom: 4px;
+  }
+  .verdict.disease h2 { color: #e05252; }
+  .verdict.safe h2    { color: var(--safe); }
+  .verdict p { font-size: 13px; color: var(--muted); }
+  .risk-badge {
+    margin-left: auto; flex-shrink: 0;
+    font-size: 13px; font-weight: 700;
+    padding: 8px 18px; border-radius: 20px;
+  }
+  .risk-high     { background: rgba(224,82,82,0.2); color: #e05252; }
+  .risk-moderate { background: rgba(210,153,34,0.2); color: #d29922; }
+  .risk-low      { background: rgba(46,160,67,0.2); color: var(--safe); }
+
+  /* ── Model Probabilities ── */
+  .prob-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px; margin-bottom: 28px;
+  }
+  .prob-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    text-align: center;
+  }
+  .prob-card.ensemble {
+    border-color: rgba(224,82,82,0.4);
+    background: rgba(224,82,82,0.05);
+  }
+  .prob-card .model-name {
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    margin-bottom: 8px;
+  }
+  .prob-card .prob-value {
+    font-size: 28px; font-weight: 800;
+    color: var(--heading); line-height: 1;
+  }
+  .prob-card.ensemble .prob-value { color: var(--accent); }
+  .prob-bar {
+    height: 4px; background: var(--border);
+    border-radius: 2px; margin-top: 10px; overflow: hidden;
+  }
+  .prob-fill { height: 100%; border-radius: 2px; transition: width 0.8s ease; }
+
+  /* ── Section Card ── */
+  .section-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 20px; overflow: hidden;
+  }
+  .section-header {
+    padding: 13px 20px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.02);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .section-header h3 {
+    font-size: 12px; font-weight: 700;
+    color: var(--heading); text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .tag {
+    font-size: 10px; font-weight: 600; padding: 2px 8px;
+    border-radius: 10px; margin-left: auto;
+  }
+  .tag-shap { background: rgba(224,82,82,0.15); color: #e05252; }
+  .tag-lime { background: rgba(45,125,210,0.15); color: #2d7dd2; }
+
+  /* ── Feature Table ── */
+  .feat-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .feat-table th {
+    padding: 10px 16px; text-align: left;
+    font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--border);
+  }
+  .feat-table td {
+    padding: 10px 16px;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+    vertical-align: middle;
+  }
+  .feat-table tr:last-child td { border-bottom: none; }
+  .feat-table tr:hover td { background: rgba(255,255,255,0.02); }
+  .shap-bar-wrap {
+    display: flex; align-items: center; gap: 8px; min-width: 120px;
+  }
+  .shap-mini {
+    height: 6px; border-radius: 3px; min-width: 2px;
+  }
+  .shap-pos { background: #e05252; }
+  .shap-neg { background: #2d7dd2; }
+  .dir-up   { color: #e05252; font-weight: 600; }
+  .dir-down { color: #2d7dd2; font-weight: 600; }
+
+  /* ── Plot Images ── */
+  .plot-wrap {
+    padding: 20px;
+    display: flex; justify-content: center;
+  }
+  .plot-wrap img {
+    max-width: 100%; border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  .plot-row {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 0; border-top: 1px solid var(--border);
+  }
+  .plot-row .plot-wrap:first-child {
+    border-right: 1px solid var(--border);
+  }
+
+  /* ── Download Button ── */
+  .download-row {
+    display: flex; justify-content: center;
+    margin: 28px 0 0;
+  }
+  .btn-download {
+    background: linear-gradient(135deg, #1f6feb, #1158c7);
+    color: white; font-size: 14px; font-weight: 700;
+    padding: 13px 36px; border-radius: var(--radius);
+    text-decoration: none;
+    display: flex; align-items: center; gap: 10px;
+    transition: opacity 0.2s;
+  }
+  .btn-download:hover { opacity: 0.9; }
+
+  footer {
+    text-align: center; font-size: 11px; color: var(--muted);
+    padding: 24px; border-top: 1px solid var(--border); margin-top: 40px;
+  }
+
+  @media (max-width: 640px) {
+    .prob-row { grid-template-columns: repeat(2, 1fr); }
+    .plot-row { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-icon">🫀</div>
+  <div>
+    <h1>Prediction Result</h1>
+    <p>Ensemble Model — RF + SVM + ANN &nbsp;|&nbsp; {{ result.timestamp }}</p>
+  </div>
+  <a href="/" class="back-btn">← New Patient</a>
+</header>
+
+<main>
+
+  <!-- ── Verdict Banner ── -->
+  {% set is_disease = result.prediction == 1 %}
+  <div class="verdict {{ 'disease' if is_disease else 'safe' }}">
+    <div class="verdict-icon">{{ '🚨' if is_disease else '✅' }}</div>
+    <div>
+      <h2>{{ result.outcome }}</h2>
+      <p>Ensemble probability: <strong>{{ result.p_ens }}%</strong> &nbsp;|&nbsp;
+         Based on soft voting across 3 independent models.</p>
+    </div>
+    <span class="risk-badge
+      {{ 'risk-high' if 'High' in result.risk_level else
+         'risk-moderate' if 'Moderate' in result.risk_level else 'risk-low' }}">
+      {{ result.risk_level }}
+    </span>
+  </div>
+
+  <!-- ── Model Probabilities ── -->
+  <div class="prob-row">
+    {% for name, prob, color in [
+        ('Random Forest', result.p_rf,  '#27ae60'),
+        ('SVM (RBF)',     result.p_svm, '#8e44ad'),
+        ('ANN (MLP)',     result.p_ann, '#2980b9'),
+        ('Ensemble',      result.p_ens, '#e05252')
+    ] %}
+    <div class="prob-card {{ 'ensemble' if name == 'Ensemble' else '' }}">
+      <div class="model-name">{{ name }}</div>
+      <div class="prob-value">{{ prob }}%</div>
+      <div class="prob-bar">
+        <div class="prob-fill" style="width: {{ prob }}%; background-color: {{ color }};"></div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- ── SHAP Feature Table ── -->
+  <div class="section-card">
+    <div class="section-header">
+      <h3>🔍 SHAP Feature Contributions</h3>
+      <span class="tag tag-shap">Global + Local</span>
+    </div>
+    <table class="feat-table">
+      <thead>
+        <tr>
+          <th>Feature</th>
+          <th>Value</th>
+          <th>SHAP Impact</th>
+          <th>Direction</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in result.feature_table %}
+        <tr>
+          <td>
+            <span style="color:var(--heading); font-weight:500">
+              {{ feature_labels[row.feature] }}
+            </span>
+          </td>
+          <td style="color:var(--muted); font-family:monospace">{{ row.value }}</td>
+          <td>
+            <div class="shap-bar-wrap">
+              {% set bar_w = [((row.shap | abs) * 300) | int, 80] | min %}
+              <div class="shap-mini {{ 'shap-pos' if row.shap > 0 else 'shap-neg' }}"
+                   style="width:{{ bar_w }}px"></div>
+              <span style="font-family:monospace; font-size:12px; color:var(--muted)">
+                {{ '%+.4f' | format(row.shap) }}
+              </span>
+            </div>
+          </td>
+          <td class="{{ 'dir-up' if row.shap > 0 else 'dir-down' }}">
+            {{ row.direction }}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── SHAP Plots ── -->
+  <div class="section-card">
+    <div class="section-header">
+      <h3>📊 SHAP Visualisations</h3>
+      <span class="tag tag-shap">SHapley Additive exPlanations</span>
+    </div>
+    <div class="plot-row">
+      <div class="plot-wrap">
+        <img src="data:image/png;base64,{{ result.shap_bar_img }}"
+             alt="SHAP Feature Importance Bar Chart">
+      </div>
+      <div class="plot-wrap">
+        <img src="data:image/png;base64,{{ result.shap_waterfall_img }}"
+             alt="SHAP Waterfall Plot">
+      </div>
+    </div>
+  </div>
+
+  <!-- ── LIME Plot ── -->
+  <div class="section-card">
+    <div class="section-header">
+      <h3>🧩 LIME Local Explanation</h3>
+      <span class="tag tag-lime">Local Interpretable Model-Agnostic</span>
+    </div>
+    <div class="plot-wrap">
+      <img src="data:image/png;base64,{{ result.lime_img }}"
+           alt="LIME Feature Weights">
+    </div>
+  </div>
+
+  <!-- ── Download Report ── -->
+  <div class="download-row">
+    <a href="/report/{{ result.report_id }}" class="btn-download">
+      📄 Download Clinical PDF Report
+    </a>
+  </div>
+
+</main>
+
+<footer>
+  ⚠ Research tool only — not a substitute for professional medical advice &nbsp;|&nbsp;
+  Report ID: {{ result.report_id }}
+</footer>
+
+</body>
+</html>

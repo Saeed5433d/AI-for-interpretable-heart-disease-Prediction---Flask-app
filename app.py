@@ -52,7 +52,7 @@ warnings.filterwarnings("ignore")
 tf.get_logger().setLevel("ERROR")
 
 # ── App setup ─────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+app = Flask(__name__, template_folder="interface")
 app.config["REPORT_FOLDER"] = os.path.join(os.path.dirname(__file__), "reports")
 os.makedirs(app.config["REPORT_FOLDER"], exist_ok=True)
 
