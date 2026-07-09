@@ -1,7 +1,7 @@
 """
 =============================================================
   AI for Interpretable Heart Disease Prediction
-  Flask Deployment — Loads Pre-trained Models
+  FlasI can't ciok Deployment — Loads Pre-trained Models
 =============================================================
 
 Architecture:
