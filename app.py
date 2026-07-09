@@ -1,43 +1,47 @@
 """
 =============================================================
   AI for Interpretable Heart Disease Prediction
-  Flask Web Application
+  Flask Deployment — Loads Pre-trained Models
 =============================================================
 
-Routes:
-  GET  /              → Patient input form
-  POST /predict       → Run ensemble prediction + SHAP + LIME
-  GET  /report/<id>   → Download PDF clinical report
+Architecture:
+  DEVELOPMENT (Feature_Selection_Pipeline.py):
+    Dataset → Cleaning → RFE / Boruta → Train Models → Save
+
+  DEPLOYMENT (this file):
+    User → Flask → Load Saved Models → Prediction → SHAP → LIME → PDF
+
+Key change from previous version:
+  Before: trained all 3 models from scratch at every startup (~2 min)
+  Now:    loads pre-saved models instantly (~3 seconds)
+  
+  The feature list is also loaded from metadata.pkl so Flask
+  automatically uses whatever feature subset won (All / RFE / Boruta).
 """
 
 import os
 import io
 import uuid
+import pickle
 import base64
 import warnings
 import datetime
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")   # non-interactive backend — required for Flask
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 from flask import (Flask, render_template, request,
                    jsonify, send_file, abort)
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import shap
 import lime
 import lime.lime_tabular
+from sklearn.preprocessing import StandardScaler
 
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers, callbacks
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -46,30 +50,25 @@ from reportlab.lib.units import cm
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                  Table, TableStyle, Image as RLImage,
                                  HRFlowable)
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER
 
 warnings.filterwarnings("ignore")
 tf.get_logger().setLevel("ERROR")
 
 # ── App setup ─────────────────────────────────────────────────────────────────
-app = Flask(__name__, template_folder="interface")
+app = Flask(__name__)
 app.config["REPORT_FOLDER"] = os.path.join(os.path.dirname(__file__), "reports")
 os.makedirs(app.config["REPORT_FOLDER"], exist_ok=True)
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
-tf.random.set_seed(RANDOM_STATE)
 
-# ── IMPORTANT: Update this to YOUR local CSV path ──
-# Put Book1.csv in the same folder as app.py, or give the full path
-DATA_PATH = "Book1.csv"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# Put Book1.csv in the same folder as app.py
+DATA_PATH  = "heart_disease_combined.csv"
+MODEL_DIR  = "saved_models"
 
-FEATURE_NAMES = [
-    "age", "sex", "cp", "trestbps", "chol",
-    "fbs", "restecg", "thalach", "exang",
-    "oldpeak", "slope", "ca", "thal"
-]
-
+# Full 13 feature labels (for UI display regardless of subset used)
 FEATURE_LABELS = {
     "age":      "Age (years)",
     "sex":      "Sex (1=Male, 0=Female)",
@@ -86,49 +85,139 @@ FEATURE_LABELS = {
     "thal":     "Thalassemia (0–3)",
 }
 
-TARGET_CANDIDATES = ["target", "condition", "num", "heart_disease",
-                     "output", "diagnosis", "label", "class", "disease"]
+# Hints for each feature (shown in the input form)
+FEATURE_HINTS = {
+    "age":      "Patient age in years",
+    "sex":      "1 = Male, 0 = Female",
+    "cp":       "0=Typical angina, 1=Atypical, 2=Non-anginal, 3=Asymptomatic",
+    "trestbps": "mmHg on admission",
+    "chol":     "Serum cholesterol in mg/dl",
+    "fbs":      "1 if fasting blood sugar > 120 mg/dl",
+    "restecg":  "0=Normal, 1=ST-T abnormality, 2=LV hypertrophy",
+    "thalach":  "Maximum heart rate achieved",
+    "exang":    "1 = Yes, 0 = No",
+    "oldpeak":  "ST depression induced by exercise relative to rest",
+    "slope":    "0=Upsloping, 1=Flat, 2=Downsloping",
+    "ca":       "Number of major vessels coloured by fluoroscopy (0–4)",
+    "thal":     "0=Normal, 1=Fixed defect, 2=Reversible defect, 3=Other",
+}
 
-# ── Global model store (loaded once at startup) ───────────────────────────────
+TARGET_CANDIDATES = ["target", "condition", "num", "heart_disease", "output",
+                     "diagnosis", "label", "class", "disease"]
+
+# Global model store
 MODELS = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATA LOADING
+#  MODEL LOADING
 # ══════════════════════════════════════════════════════════════════════════════
-def _detect_encoding(filepath):
+def load_saved_models():
     """
-    Try common encodings in order. Many CSVs exported from Excel on
-    Windows use 'cp1252' or 'latin-1' instead of pure UTF-8, which
-    causes UnicodeDecodeError on bytes like 0x96 (en-dash character).
+    Load pre-trained models saved by Feature_Selection_Pipeline.py.
+    Falls back to training from scratch if saved models not found.
     """
-    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
-    for enc in encodings_to_try:
+    meta_path = os.path.join(MODEL_DIR, "metadata.pkl")
+
+    if not os.path.exists(meta_path):
+        print(f"⚠  No saved models found in '{MODEL_DIR}/'")
+        print("   Run Feature_Selection_Pipeline.py first to train and save models.")
+        print("   Falling back to training from scratch...")
+        train_from_scratch()
+        return
+
+    print(f"✓ Found saved models in '{MODEL_DIR}/' — loading...")
+
+    # Load metadata (tells us which features the best model used)
+    with open(meta_path, "rb") as f:
+        metadata = pickle.load(f)
+
+    feature_names = metadata["feature_names"]
+    feature_set   = metadata["feature_set"]
+    print(f"  Feature set : '{feature_set}' ({len(feature_names)} features)")
+    print(f"  Features    : {feature_names}")
+    print(f"  Saved AUC   : {metadata['ensemble_auc']:.4f}")
+    print(f"  Saved Acc   : {metadata['ensemble_acc']*100:.2f}%")
+
+    # Load RF
+    with open(os.path.join(MODEL_DIR, "rf_model.pkl"), "rb") as f:
+        rf = pickle.load(f)
+
+    # Load SVM
+    with open(os.path.join(MODEL_DIR, "svm_model.pkl"), "rb") as f:
+        svm = pickle.load(f)
+
+    # Load ANN
+    ann = keras.models.load_model(
+        os.path.join(MODEL_DIR, "ann_model.keras")
+    )
+
+    # Load scaler
+    with open(os.path.join(MODEL_DIR, "scaler.pkl"), "rb") as f:
+        scaler = pickle.load(f)
+
+    # Build SHAP explainer on a background sample
+    # We need training data for this — load and prepare a sample
+    df = _load_data_for_explainers(feature_names)
+    X_bg = scaler.transform(df[feature_names].values)
+    bg_idx = np.random.choice(X_bg.shape[0],
+                               size=min(100, X_bg.shape[0]),
+                               replace=False)
+    shap_explainer = shap.DeepExplainer(ann, X_bg[bg_idx])
+
+    # Build LIME explainer
+    lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data=X_bg,
+        feature_names=feature_names,
+        class_names=["No Disease", "Disease"],
+        mode="classification",
+        discretize_continuous=True,
+        random_state=RANDOM_STATE
+    )
+
+    MODELS.update({
+        "rf": rf, "svm": svm, "ann": ann,
+        "scaler": scaler,
+        "feature_names":   feature_names,
+        "feature_set":     feature_set,
+        "shap_explainer":  shap_explainer,
+        "lime_explainer":  lime_explainer,
+        "metadata":        metadata,
+    })
+
+    print(f"✓ All models loaded. Flask is ready.")
+
+
+def _load_data_for_explainers(feature_names):
+    """Load and clean CSV — used to build SHAP/LIME background."""
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError(
+            f"\n❌ CSV not found at: {os.path.abspath(DATA_PATH)}\n"
+            f"   Place Book1.csv in the same folder as app.py.\n"
+        )
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    encoding = "latin-1"
+    for enc in encodings:
         try:
-            with open(filepath, "r", encoding=enc) as f:
+            with open(DATA_PATH, "r", encoding=enc) as f:
                 f.read()
-            return enc
+            encoding = enc
+            break
         except (UnicodeDecodeError, UnicodeError):
             continue
-    return "latin-1"   # latin-1 never raises — ultimate fallback
 
-
-def _find_header_row(filepath, encoding="utf-8"):
-    with open(filepath, "r", encoding=encoding, errors="replace") as f:
+    # Find header row
+    header_row = 0
+    with open(DATA_PATH, "r", encoding=encoding, errors="replace") as f:
         for i, line in enumerate(f):
             if i >= 10:
                 break
             cells = [c.strip().lower() for c in line.split(",")]
             if "age" in cells or "target" in cells:
-                return i
-    return 0
+                header_row = i
+                break
 
-
-def load_and_prepare(filepath):
-    encoding = _detect_encoding(filepath)
-    print(f"ℹ  Detected file encoding: {encoding}")
-    header_row = _find_header_row(filepath, encoding=encoding)
-    df = pd.read_csv(filepath, header=header_row, encoding=encoding)
+    df = pd.read_csv(DATA_PATH, header=header_row, encoding=encoding)
     df.columns = df.columns.str.strip()
 
     col_map = {c.lower(): c for c in df.columns}
@@ -139,44 +228,49 @@ def load_and_prepare(filepath):
             break
     if target_col is None:
         target_col = df.columns[-1]
-
     df = df.rename(columns={target_col: "target"})
     df["target"] = pd.to_numeric(df["target"], errors="coerce")
-    if df["target"].nunique(dropna=True) > 2:
-        df["target"] = (df["target"] > 0).astype(int)
     for col in df.columns:
         if col != "target":
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df = df.drop_duplicates().dropna()
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MODEL TRAINING (runs once at startup)
-# ══════════════════════════════════════════════════════════════════════════════
-def build_and_train_models(df):
-    """Train RF, SVM, ANN on the full dataset split."""
-    X = df[FEATURE_NAMES].values
-    y = df["target"].values
+def train_from_scratch():
+    """
+    Fallback: train models from scratch if no saved models found.
+    Mirrors the finalized model configs.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.svm import SVC
+    from sklearn.pipeline import Pipeline
+    from sklearn.model_selection import train_test_split
+    from tensorflow.keras import layers, callbacks
 
-    X_train, X_test, y_train, y_test = train_test_split(
+    ALL_FEATURES = [
+        "age", "sex", "cp", "trestbps", "chol",
+        "fbs", "restecg", "thalach", "exang",
+        "oldpeak", "slope", "ca", "thal"
+    ]
+
+    print("⏳ Training models from scratch (no saved models found)...")
+    df      = _load_data_for_explainers(ALL_FEATURES)
+    X       = df[ALL_FEATURES].values
+    y       = df["target"].values
+    X_train, _, y_train, _ = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
     )
-
-    scaler = StandardScaler()
+    scaler     = StandardScaler()
     X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc  = scaler.transform(X_test)
 
-    # Random Forest
     rf = RandomForestClassifier(
-        n_estimators=200, max_depth=None, min_samples_split=5,
-        min_samples_leaf=2, max_features="sqrt", bootstrap=True,
-        class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1
+        n_estimators=200, min_samples_split=5, min_samples_leaf=2,
+        max_features="sqrt", bootstrap=True, class_weight="balanced",
+        random_state=RANDOM_STATE, n_jobs=-1
     )
     rf.fit(X_train, y_train)
 
-    # SVM
     svm = Pipeline([
         ("scaler", StandardScaler()),
         ("svm", SVC(kernel="rbf", C=1.0, gamma="scale",
@@ -185,16 +279,15 @@ def build_and_train_models(df):
     ])
     svm.fit(X_train, y_train)
 
-    # ANN
     ann = keras.Sequential([
-        layers.Input(shape=(len(FEATURE_NAMES),)),
+        layers.Input(shape=(len(ALL_FEATURES),)),
         layers.Dense(64, activation="relu", kernel_initializer="he_normal"),
         layers.BatchNormalization(), layers.Dropout(0.3),
         layers.Dense(32, activation="relu", kernel_initializer="he_normal"),
         layers.BatchNormalization(), layers.Dropout(0.2),
         layers.Dense(16, activation="relu", kernel_initializer="he_normal"),
         layers.Dense(1, activation="sigmoid")
-    ], name="MLP_HeartDisease")
+    ])
     ann.compile(optimizer=keras.optimizers.Adam(0.001),
                 loss="binary_crossentropy",
                 metrics=["accuracy", keras.metrics.AUC(name="auc")])
@@ -207,47 +300,46 @@ def build_and_train_models(df):
                                             patience=10, min_lr=1e-6)
             ])
 
-    # SHAP background (100 training samples)
-    bg_idx  = np.random.choice(X_train_sc.shape[0], size=100, replace=False)
+    bg_idx = np.random.choice(X_train_sc.shape[0], size=100, replace=False)
     shap_explainer = shap.DeepExplainer(ann, X_train_sc[bg_idx])
-
-    # LIME explainer
     lime_explainer = lime.lime_tabular.LimeTabularExplainer(
-        training_data=X_train_sc,
-        feature_names=FEATURE_NAMES,
+        training_data=X_train_sc, feature_names=ALL_FEATURES,
         class_names=["No Disease", "Disease"],
-        mode="classification",
-        discretize_continuous=True,
+        mode="classification", discretize_continuous=True,
         random_state=RANDOM_STATE
     )
 
-    return {
+    MODELS.update({
         "rf": rf, "svm": svm, "ann": ann,
         "scaler": scaler,
+        "feature_names":  ALL_FEATURES,
+        "feature_set":    "All Features (fallback)",
         "shap_explainer": shap_explainer,
         "lime_explainer": lime_explainer,
-        "X_train": X_train,
-        "X_train_sc": X_train_sc,
-    }
+        "metadata":       {"feature_names": ALL_FEATURES,
+                           "feature_set": "All Features (fallback)"},
+    })
+    print("✓ Fallback training complete. Flask is ready.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PREDICTION + EXPLANATION PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
-def run_pipeline(patient_values: list) -> dict:
+def run_pipeline(patient_values_full: dict) -> dict:
     """
-    Full pipeline for one patient:
-      1. Soft voting ensemble prediction
-      2. SHAP values + plots
-      3. LIME explanation + plot
-      4. Return everything as base64 images + structured data
+    patient_values_full: dict of ALL 13 feature values from the form.
+    We extract only the features the best model needs.
     """
+    feature_names = MODELS["feature_names"]
     rf   = MODELS["rf"]
     svm  = MODELS["svm"]
     ann  = MODELS["ann"]
     sc   = MODELS["scaler"]
     shap_exp  = MODELS["shap_explainer"]
     lime_exp  = MODELS["lime_explainer"]
+
+    # Extract only the features this model was trained on
+    patient_values = [float(patient_values_full[f]) for f in feature_names]
 
     x_raw    = np.array(patient_values, dtype=float).reshape(1, -1)
     x_scaled = sc.transform(x_raw)
@@ -261,7 +353,7 @@ def run_pipeline(patient_values: list) -> dict:
     prediction = int(p_ens >= 0.5)
     outcome    = "Heart Disease Detected" if prediction == 1 else "No Heart Disease"
     risk_level = (
-        "High Risk"    if p_ens >= 0.70 else
+        "High Risk"     if p_ens >= 0.70 else
         "Moderate Risk" if p_ens >= 0.45 else
         "Low Risk"
     )
@@ -272,9 +364,8 @@ def run_pipeline(patient_values: list) -> dict:
         shap_vals_raw = shap_vals_raw[0]
     if shap_vals_raw.ndim == 3:
         shap_vals_raw = shap_vals_raw[:, :, 0]
-    shap_vals = shap_vals_raw[0]   # shape (13,)
+    shap_vals = shap_vals_raw[0]
 
-    # Get base value
     try:
         raw_base = shap_exp.expected_value
         if hasattr(raw_base, "numpy"):
@@ -283,9 +374,9 @@ def run_pipeline(patient_values: list) -> dict:
     except Exception:
         base_value = p_ann
 
-    shap_img    = _plot_shap_bar(shap_vals, patient_values, sc)
-    shap_waterfall = _plot_shap_waterfall(shap_vals, base_value,
-                                          x_scaled[0], patient_values, sc)
+    shap_bar_img       = _plot_shap_bar(shap_vals, feature_names, patient_values)
+    shap_waterfall_img = _plot_shap_waterfall(shap_vals, feature_names,
+                                               patient_values)
 
     # ── LIME ─────────────────────────────────────────────────────────────
     def predict_proba_fn(X):
@@ -295,46 +386,45 @@ def run_pipeline(patient_values: list) -> dict:
     lime_result = lime_exp.explain_instance(
         data_row=x_scaled[0],
         predict_fn=predict_proba_fn,
-        num_features=13,
+        num_features=len(feature_names),
         num_samples=3000,
         labels=(1,)
     )
-    lime_img = _plot_lime_bar(lime_result)
+    lime_img = _plot_lime_bar(lime_result, feature_names)
 
-    # ── Build structured feature table ───────────────────────────────────
+    # ── Feature table (SHAP ranked) ───────────────────────────────────────
     original = sc.inverse_transform(x_scaled)[0]
     feature_table = []
-    for i, fname in enumerate(FEATURE_NAMES):
+    for i, fname in enumerate(feature_names):
         feature_table.append({
             "feature":   fname,
-            "label":     FEATURE_LABELS[fname],
-            "value":     round(original[i], 2),
+            "label":     FEATURE_LABELS.get(fname, fname),
+            "value":     round(float(original[i]), 2),
             "shap":      round(float(shap_vals[i]), 4),
             "direction": "↑ Risk" if shap_vals[i] > 0 else "↓ Risk"
         })
     feature_table.sort(key=lambda x: abs(x["shap"]), reverse=True)
-
-    lime_weights = dict(lime_result.as_list(label=1))
 
     return {
         "p_rf":    round(p_rf * 100, 1),
         "p_svm":   round(p_svm * 100, 1),
         "p_ann":   round(p_ann * 100, 1),
         "p_ens":   round(p_ens * 100, 1),
-        "prediction": prediction,
-        "outcome":    outcome,
-        "risk_level": risk_level,
-        "shap_bar_img":       shap_img,
-        "shap_waterfall_img": shap_waterfall,
+        "prediction":  prediction,
+        "outcome":     outcome,
+        "risk_level":  risk_level,
+        "feature_set": MODELS["feature_set"],
+        "n_features":  len(feature_names),
+        "shap_bar_img":       shap_bar_img,
+        "shap_waterfall_img": shap_waterfall_img,
         "lime_img":           lime_img,
         "feature_table":      feature_table,
-        "lime_weights":       lime_weights,
-        "patient_values":     patient_values,
+        "patient_values":     patient_values_full,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
-# ── Plot helpers — return base64 PNG strings ──────────────────────────────────
+# ── Plot helpers ──────────────────────────────────────────────────────────────
 def _fig_to_b64(fig) -> str:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
@@ -345,16 +435,14 @@ def _fig_to_b64(fig) -> str:
     return b64
 
 
-def _plot_shap_bar(shap_vals, patient_values, scaler) -> str:
-    original = scaler.inverse_transform(
-        np.array(patient_values, dtype=float).reshape(1, -1)
-    )[0]
+def _plot_shap_bar(shap_vals, feature_names, patient_values) -> str:
     idx_sorted = np.argsort(np.abs(shap_vals))
-    feats  = [FEATURE_NAMES[i] for i in idx_sorted]
-    vals   = [shap_vals[i] for i in idx_sorted]
+    feats  = [feature_names[i] for i in idx_sorted]
+    vals   = [shap_vals[i]     for i in idx_sorted]
     colors_bar = ["#e74c3c" if v > 0 else "#2980b9" for v in vals]
 
-    fig, ax = plt.subplots(figsize=(8, 5), facecolor="#0d1117")
+    fig, ax = plt.subplots(figsize=(8, max(4, len(feats)*0.5)),
+                            facecolor="#0d1117")
     ax.set_facecolor("#0d1117")
     ax.barh(feats, vals, color=colors_bar, edgecolor="none", alpha=0.9)
     ax.axvline(0, color="#8b949e", lw=1)
@@ -369,14 +457,11 @@ def _plot_shap_bar(shap_vals, patient_values, scaler) -> str:
     return _fig_to_b64(fig)
 
 
-def _plot_shap_waterfall(shap_vals, base_val, x_scaled,
-                          patient_values, scaler) -> str:
-    original = scaler.inverse_transform(
-        np.array(patient_values, dtype=float).reshape(1, -1)
-    )[0]
-    idx = np.argsort(np.abs(shap_vals))[::-1][:8]   # top 8
-    feats = [f"{FEATURE_NAMES[i]}={original[i]:.1f}" for i in idx]
-    vals  = [shap_vals[i] for i in idx]
+def _plot_shap_waterfall(shap_vals, feature_names, patient_values) -> str:
+    n_show = min(8, len(feature_names))
+    idx    = np.argsort(np.abs(shap_vals))[::-1][:n_show]
+    feats  = [f"{feature_names[i]}={patient_values[i]:.1f}" for i in idx]
+    vals   = [shap_vals[i] for i in idx]
     colors_bar = ["#e74c3c" if v > 0 else "#2980b9" for v in vals]
 
     fig, ax = plt.subplots(figsize=(8, 4), facecolor="#0d1117")
@@ -395,14 +480,15 @@ def _plot_shap_waterfall(shap_vals, base_val, x_scaled,
     return _fig_to_b64(fig)
 
 
-def _plot_lime_bar(lime_result) -> str:
+def _plot_lime_bar(lime_result, feature_names) -> str:
     feat_weights = lime_result.as_list(label=1)
     feat_weights.sort(key=lambda x: x[1])
     feats   = [f[0] for f in feat_weights]
     weights = [f[1] for f in feat_weights]
     colors_bar = ["#e74c3c" if w > 0 else "#2980b9" for w in weights]
 
-    fig, ax = plt.subplots(figsize=(8, 5), facecolor="#0d1117")
+    fig, ax = plt.subplots(figsize=(8, max(4, len(feats)*0.5)),
+                            facecolor="#0d1117")
     ax.set_facecolor("#0d1117")
     ax.barh(feats, weights, color=colors_bar, edgecolor="none", alpha=0.9)
     ax.axvline(0, color="#8b949e", lw=1)
@@ -421,137 +507,123 @@ def _plot_lime_bar(lime_result) -> str:
 #  PDF REPORT GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 def generate_pdf_report(result: dict, report_id: str) -> str:
-    """Generate a clinical PDF report and return its file path."""
-    path = os.path.join(app.config["REPORT_FOLDER"], f"{report_id}.pdf")
-
-    doc = SimpleDocTemplate(path, pagesize=A4,
-                            leftMargin=2*cm, rightMargin=2*cm,
-                            topMargin=2*cm, bottomMargin=2*cm)
-
+    path   = os.path.join(app.config["REPORT_FOLDER"], f"{report_id}.pdf")
+    doc    = SimpleDocTemplate(path, pagesize=A4,
+                               leftMargin=2*cm, rightMargin=2*cm,
+                               topMargin=2*cm, bottomMargin=2*cm)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("Title", parent=styles["Heading1"],
-                                  fontSize=18, textColor=colors.HexColor("#1a1a2e"),
-                                  spaceAfter=4, alignment=TA_CENTER)
-    sub_style   = ParagraphStyle("Sub", parent=styles["Normal"],
-                                  fontSize=10, textColor=colors.HexColor("#666666"),
-                                  spaceAfter=2, alignment=TA_CENTER)
-    section_style = ParagraphStyle("Section", parent=styles["Heading2"],
-                                    fontSize=13, textColor=colors.HexColor("#16213e"),
-                                    spaceBefore=14, spaceAfter=6)
-    body_style  = ParagraphStyle("Body", parent=styles["Normal"],
-                                  fontSize=10, textColor=colors.HexColor("#333333"),
-                                  spaceAfter=4)
-    risk_color  = ("#c0392b" if result["prediction"] == 1 else "#27ae60")
+
+    title_s = ParagraphStyle("T", parent=styles["Heading1"], fontSize=17,
+                              textColor=colors.HexColor("#1a1a2e"),
+                              spaceAfter=4, alignment=TA_CENTER)
+    sub_s   = ParagraphStyle("S", parent=styles["Normal"], fontSize=9,
+                              textColor=colors.HexColor("#666666"),
+                              spaceAfter=2, alignment=TA_CENTER)
+    sec_s   = ParagraphStyle("Sec", parent=styles["Heading2"], fontSize=12,
+                              textColor=colors.HexColor("#16213e"),
+                              spaceBefore=12, spaceAfter=5)
+    body_s  = ParagraphStyle("B", parent=styles["Normal"], fontSize=9,
+                              textColor=colors.HexColor("#333333"), spaceAfter=4)
+    risk_c  = "#c0392b" if result["prediction"] == 1 else "#27ae60"
 
     story = []
 
-    # ── Header ────────────────────────────────────────────────────────────
-    story.append(Paragraph("AI for Interpretable Heart Disease Prediction", title_style))
-    story.append(Paragraph("Clinical Prediction Report", sub_style))
-    story.append(Paragraph(f"Generated: {result['timestamp']}  |  Report ID: {report_id}",
-                            sub_style))
+    # Header
+    story.append(Paragraph("AI for Interpretable Heart Disease Prediction", title_s))
+    story.append(Paragraph("Clinical Prediction Report", sub_s))
+    story.append(Paragraph(
+        f"Generated: {result['timestamp']}  |  Report ID: {report_id}  |  "
+        f"Feature Set: {result['feature_set']} ({result['n_features']} features)",
+        sub_s))
     story.append(HRFlowable(width="100%", thickness=2,
-                             color=colors.HexColor("#16213e"), spaceAfter=12))
+                             color=colors.HexColor("#16213e"), spaceAfter=10))
 
-    # ── Prediction Summary ────────────────────────────────────────────────
-    story.append(Paragraph("Prediction Summary", section_style))
-
-    outcome_style = ParagraphStyle("Outcome", parent=styles["Normal"],
-                                    fontSize=16, fontName="Helvetica-Bold",
-                                    textColor=colors.HexColor(risk_color),
-                                    spaceAfter=8, alignment=TA_CENTER)
-    story.append(Paragraph(f"▶  {result['outcome']}  ({result['risk_level']})", outcome_style))
+    # Prediction summary
+    story.append(Paragraph("Prediction Summary", sec_s))
+    out_s = ParagraphStyle("Out", parent=styles["Normal"], fontSize=15,
+                            fontName="Helvetica-Bold",
+                            textColor=colors.HexColor(risk_c),
+                            spaceAfter=8, alignment=TA_CENTER)
+    story.append(Paragraph(
+        f"▶  {result['outcome']}  —  {result['risk_level']}", out_s))
 
     pred_data = [
-        ["Model", "Disease Probability", "Contribution"],
+        ["Model", "P(Disease)", "Weight"],
         ["Random Forest",  f"{result['p_rf']}%",  "33%"],
         ["SVM (RBF)",      f"{result['p_svm']}%", "33%"],
         ["ANN (MLP)",      f"{result['p_ann']}%", "33%"],
-        ["Ensemble (Avg)", f"{result['p_ens']}%", "Final Decision"],
+        ["Ensemble (Avg)", f"{result['p_ens']}%", "Final"],
     ]
-    pred_table = Table(pred_data, colWidths=[6*cm, 5*cm, 5*cm])
-    pred_table.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor("#16213e")),
-        ("TEXTCOLOR",    (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1, -1), 10),
-        ("ALIGN",        (0, 0), (-1, -1), "CENTER"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -2),
-         [colors.HexColor("#f8f9fa"), colors.white]),
-        ("BACKGROUND",   (0, -1), (-1, -1), colors.HexColor("#ffeeba")),
-        ("FONTNAME",     (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor("#dee2e6")),
-        ("ROWHEIGHT",    (0, 0), (-1, -1), 22),
+    pt = Table(pred_data, colWidths=[6*cm, 5*cm, 5*cm])
+    pt.setStyle(TableStyle([
+        ("BACKGROUND",     (0,0),(-1,0),  colors.HexColor("#16213e")),
+        ("TEXTCOLOR",      (0,0),(-1,0),  colors.white),
+        ("FONTNAME",       (0,0),(-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0,0),(-1,-1), 9),
+        ("ALIGN",          (0,0),(-1,-1), "CENTER"),
+        ("ROWBACKGROUNDS", (0,1),(-1,-2), [colors.HexColor("#f8f9fa"),
+                                            colors.white]),
+        ("BACKGROUND",     (0,-1),(-1,-1), colors.HexColor("#ffeeba")),
+        ("FONTNAME",       (0,-1),(-1,-1), "Helvetica-Bold"),
+        ("GRID",           (0,0),(-1,-1), 0.5, colors.HexColor("#dee2e6")),
+        ("ROWHEIGHT",      (0,0),(-1,-1), 20),
     ]))
-    story.append(pred_table)
-    story.append(Spacer(1, 0.4*cm))
-
-    # ── Patient Features ──────────────────────────────────────────────────
-    story.append(Paragraph("Patient Clinical Features", section_style))
-    feat_data = [["Feature", "Value", "SHAP Impact", "Direction"]]
-    for row in result["feature_table"]:
-        feat_data.append([
-            row["label"],
-            str(row["value"]),
-            f"{row['shap']:+.4f}",
-            row["direction"]
-        ])
-    feat_table = Table(feat_data, colWidths=[7*cm, 2.5*cm, 3*cm, 3.5*cm])
-    feat_table.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor("#16213e")),
-        ("TEXTCOLOR",    (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1, -1), 9),
-        ("ALIGN",        (1, 0), (-1, -1), "CENTER"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [colors.HexColor("#f8f9fa"), colors.white]),
-        ("GRID",         (0, 0), (-1, -1), 0.4, colors.HexColor("#dee2e6")),
-        ("ROWHEIGHT",    (0, 0), (-1, -1), 18),
-    ]))
-    story.append(feat_table)
-    story.append(Spacer(1, 0.4*cm))
-
-    # ── SHAP Plot ─────────────────────────────────────────────────────────
-    story.append(Paragraph("SHAP Explainability", section_style))
-    story.append(Paragraph(
-        "SHAP (SHapley Additive exPlanations) shows how each clinical feature "
-        "contributed to this prediction. Red bars push toward disease; "
-        "blue bars push away from disease.", body_style))
-
-    shap_img_data = base64.b64decode(result["shap_bar_img"])
-    shap_img_buf  = io.BytesIO(shap_img_data)
-    story.append(RLImage(shap_img_buf, width=14*cm, height=9*cm))
+    story.append(pt)
     story.append(Spacer(1, 0.3*cm))
 
-    wf_img_data = base64.b64decode(result["shap_waterfall_img"])
-    wf_img_buf  = io.BytesIO(wf_img_data)
-    story.append(RLImage(wf_img_buf, width=14*cm, height=7*cm))
+    # Feature table
+    story.append(Paragraph("SHAP Clinical Feature Analysis", sec_s))
+    feat_data = [["Feature", "Value", "SHAP", "Direction"]]
+    for row in result["feature_table"]:
+        feat_data.append([
+            row["label"], str(row["value"]),
+            f"{row['shap']:+.4f}", row["direction"]
+        ])
+    ft = Table(feat_data, colWidths=[7*cm, 2.5*cm, 3*cm, 3.5*cm])
+    ft.setStyle(TableStyle([
+        ("BACKGROUND",     (0,0),(-1,0),  colors.HexColor("#16213e")),
+        ("TEXTCOLOR",      (0,0),(-1,0),  colors.white),
+        ("FONTNAME",       (0,0),(-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0,0),(-1,-1), 8),
+        ("ALIGN",          (1,0),(-1,-1), "CENTER"),
+        ("ROWBACKGROUNDS", (0,1),(-1,-1), [colors.HexColor("#f8f9fa"),
+                                            colors.white]),
+        ("GRID",           (0,0),(-1,-1), 0.4, colors.HexColor("#dee2e6")),
+        ("ROWHEIGHT",      (0,0),(-1,-1), 16),
+    ]))
+    story.append(ft)
+    story.append(Spacer(1, 0.3*cm))
 
-    # ── LIME Plot ─────────────────────────────────────────────────────────
-    story.append(Paragraph("LIME Explainability", section_style))
+    # SHAP plots
+    story.append(Paragraph("SHAP Explainability", sec_s))
     story.append(Paragraph(
-        "LIME (Local Interpretable Model-Agnostic Explanations) fits a "
-        "linear model around this patient's neighbourhood to explain the "
-        "prediction locally. Positive weights push toward disease; "
-        "negative weights push away.", body_style))
+        "Red bars push prediction toward disease. "
+        "Blue bars push away from disease.", body_s))
+    story.append(RLImage(io.BytesIO(base64.b64decode(result["shap_bar_img"])),
+                          width=14*cm, height=8*cm))
+    story.append(Spacer(1, 0.2*cm))
+    story.append(RLImage(io.BytesIO(base64.b64decode(result["shap_waterfall_img"])),
+                          width=14*cm, height=6*cm))
 
-    lime_img_data = base64.b64decode(result["lime_img"])
-    lime_img_buf  = io.BytesIO(lime_img_data)
-    story.append(RLImage(lime_img_buf, width=14*cm, height=9*cm))
+    # LIME plot
+    story.append(Paragraph("LIME Local Explanation", sec_s))
+    story.append(Paragraph(
+        "Locally fitted linear approximation around this patient's "
+        "neighbourhood. Positive weights push toward disease.", body_s))
+    story.append(RLImage(io.BytesIO(base64.b64decode(result["lime_img"])),
+                          width=14*cm, height=8*cm))
 
-    # ── Disclaimer ────────────────────────────────────────────────────────
-    story.append(Spacer(1, 0.5*cm))
+    # Disclaimer
+    story.append(Spacer(1, 0.4*cm))
     story.append(HRFlowable(width="100%", thickness=1,
                              color=colors.HexColor("#dee2e6")))
-    disclaimer_style = ParagraphStyle("Disc", parent=styles["Normal"],
-                                       fontSize=8,
-                                       textColor=colors.HexColor("#999999"),
-                                       spaceAfter=2)
+    disc_s = ParagraphStyle("D", parent=styles["Normal"], fontSize=7,
+                             textColor=colors.HexColor("#999999"))
     story.append(Paragraph(
-        "⚠  DISCLAIMER: This report is generated by an AI research system "
+        "⚠ DISCLAIMER: This report is generated by an AI research system "
         "for educational and research purposes only. It is NOT a substitute "
         "for professional medical advice, diagnosis, or treatment. "
-        "Always consult a qualified physician.", disclaimer_style))
+        "Always consult a qualified physician.", disc_s))
 
     doc.build(story)
     return path
@@ -560,26 +632,38 @@ def generate_pdf_report(result: dict, report_id: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 #  FLASK ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
+ALL_FEATURES = [
+    "age", "sex", "cp", "trestbps", "chol", "fbs",
+    "restecg", "thalach", "exang", "oldpeak", "slope", "ca", "thal"
+]
+
+
 @app.route("/")
 def index():
-    """Render the patient input form."""
-    return render_template("index.html",
-                           features=FEATURE_NAMES,
-                           feature_labels=FEATURE_LABELS)
+    active_features = MODELS.get("feature_names", ALL_FEATURES)
+    return render_template(
+        "index.html",
+        all_features=ALL_FEATURES,
+        active_features=active_features,
+        feature_labels=FEATURE_LABELS,
+        feature_hints=FEATURE_HINTS,
+        feature_set=MODELS.get("feature_set", "All Features"),
+        n_features=len(active_features)
+    )
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Receive form data, run pipeline, return results + report ID."""
     try:
-        patient_values = [float(request.form.get(f, 0)) for f in FEATURE_NAMES]
+        # Collect all 13 values from the form
+        patient_values_full = {
+            f: float(request.form.get(f, 0)) for f in ALL_FEATURES
+        }
     except ValueError as e:
         return jsonify({"error": f"Invalid input: {e}"}), 400
 
-    result    = run_pipeline(patient_values)
+    result    = run_pipeline(patient_values_full)
     report_id = str(uuid.uuid4())[:8]
-
-    # Generate PDF in background
     generate_pdf_report(result, report_id)
     result["report_id"] = report_id
 
@@ -589,10 +673,8 @@ def predict():
 
 @app.route("/report/<report_id>")
 def download_report(report_id):
-    """Stream the PDF report for download."""
-    # Sanitise report_id to prevent path traversal
     safe_id = "".join(c for c in report_id if c.isalnum() or c == "-")
-    path = os.path.join(app.config["REPORT_FOLDER"], f"{safe_id}.pdf")
+    path    = os.path.join(app.config["REPORT_FOLDER"], f"{safe_id}.pdf")
     if not os.path.exists(path):
         abort(404)
     return send_file(path, as_attachment=True,
@@ -600,17 +682,26 @@ def download_report(report_id):
                      mimetype="application/pdf")
 
 
+@app.route("/model-info")
+def model_info():
+    """Simple JSON endpoint to check which models are loaded."""
+    meta = MODELS.get("metadata", {})
+    return jsonify({
+        "status":       "ready",
+        "feature_set":  MODELS.get("feature_set", "unknown"),
+        "n_features":   len(MODELS.get("feature_names", [])),
+        "features":     MODELS.get("feature_names", []),
+        "saved_auc":    meta.get("ensemble_auc", "N/A"),
+        "saved_acc":    meta.get("ensemble_acc", "N/A"),
+    })
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  STARTUP
 # ══════════════════════════════════════════════════════════════════════════════
-def startup():
-    """Load data and train models once when Flask starts."""
-    print("⏳ Loading dataset and training models — please wait...")
-    df = load_and_prepare(DATA_PATH)
-    MODELS.update(build_and_train_models(df))
-    print("✓ All models ready. Flask is live.")
-
-
 if __name__ == "__main__":
-    startup()
+    print("="*60)
+    print("  Heart Disease Prediction — Flask App")
+    print("="*60)
+    load_saved_models()
     app.run(debug=False, host="0.0.0.0", port=5000)
